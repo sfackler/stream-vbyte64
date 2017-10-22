@@ -4,3 +4,4 @@ version = "0.1.0"
 authors = ["Steven Fackler <sfackler@palantir.com>"]
 
 [dependencies]
+stdsimd = { git = "https://github.com/rust-lang-nursery/stdsimd" }
