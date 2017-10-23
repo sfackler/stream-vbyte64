@@ -20,6 +20,15 @@ fn random_values() -> Vec<u64> {
         .collect()
 }
 
+fn compressed_len(values: &[u64], b: &mut Bencher) {
+    let data_len = stream_vbyte64::max_compressed_len(values.len());
+    let mut buf = vec![0; data_len];
+    unsafe {
+        stream_vbyte64::encode(values, &mut buf);
+    }
+    b.iter(|| stream_vbyte64::compressed_len(values.len(), &buf));
+}
+
 fn scalar_encode(values: &[u64], b: &mut Bencher) {
     let mut keys = vec![0; stream_vbyte64::keys_len(values.len())];
     let mut data = vec![0; values.len() * 8];
@@ -33,11 +42,11 @@ fn scalar_encode(values: &[u64], b: &mut Bencher) {
 fn scalar_decode(values: &[u64], b: &mut Bencher) {
     let mut keys = vec![0; stream_vbyte64::keys_len(values.len())];
     let mut data = vec![0; values.len() * 8];
-    let len = unsafe { stream_vbyte64::encode_scalar(&values, &mut keys, &mut data) };
+    unsafe { stream_vbyte64::encode_scalar(&values, &mut keys, &mut data) };
     let mut decoded = vec![0; values.len()];
 
     b.iter(|| unsafe {
-        stream_vbyte64::decode_scalar(&mut decoded, &keys, &data[..len])
+        stream_vbyte64::decode_scalar(&mut decoded, &keys, &data)
     });
     b.bytes = 8 * values.len() as u64;
 }
@@ -53,11 +62,23 @@ fn encode(values: &[u64], b: &mut Bencher) {
 fn decode(values: &[u64], b: &mut Bencher) {
     let data_len = stream_vbyte64::max_compressed_len(values.len());
     let mut buf = vec![0; data_len];
-    let len = unsafe { stream_vbyte64::encode(&values, &mut buf) };
+    unsafe { stream_vbyte64::encode(&values, &mut buf) };
     let mut decoded = vec![0; values.len()];
 
-    b.iter(|| unsafe { stream_vbyte64::decode(&mut decoded, &buf[..len]) });
+    b.iter(|| stream_vbyte64::decode(&mut decoded, &buf));
     b.bytes = 8 * values.len() as u64
+}
+
+#[bench]
+fn compressed_len_one_byte(b: &mut Bencher) {
+    let values = one_byte_values();
+    compressed_len(&values, b);
+}
+
+#[bench]
+fn compressed_len_random(b: &mut Bencher) {
+    let values = random_values();
+    compressed_len(&values, b);
 }
 
 #[bench]

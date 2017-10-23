@@ -19,6 +19,26 @@ pub fn max_compressed_len(values: usize) -> usize {
     keys_len(values) + values * 8
 }
 
+pub fn compressed_len(values: usize, data: &[u8]) -> usize {
+    let mut len = 0;
+    let keys = keys_len(values) / 3;
+    for i in 0..keys {
+        let mut key = 0u32;
+        unsafe {
+            ptr::copy_nonoverlapping(
+                data.as_ptr().offset(3 * i as isize),
+                &mut key as *mut u32 as *mut u8,
+                3,
+            );
+        }
+        key = u32::from_le(key);
+        len += tables::LENGTH[key as usize & ((1 << 12) - 1)] as usize;
+        len += tables::LENGTH[key as usize >> 12] as usize;
+    }
+
+    len - (8 - values % 8)
+}
+
 unsafe fn encode_single(value: u64, out: &mut *mut u8) -> u8 {
     let value = value.to_le();
     if value < 1 << 8 {
@@ -199,25 +219,38 @@ pub unsafe fn decode_avx(output: &mut [u64], keys: &[u8], data: &[u8]) -> usize 
     let mut keyptr = keys.as_ptr();
     let mut dataptr = data.as_ptr();
 
-    let iters = output.len() / 8;
+    // since the avx codepath loads a full 64 bytes per iteration, we need to make sure to not load
+    // past the end of `data`. The worst case is if each value is 1 byte, in which case we read the
+    // final 8 bytes of real data, and 56 bytes past the end. If we conservatively always take the
+    // scalar path for the last 56 values, we're good.
+    let block_loadable = output.len().saturating_sub(56);
+    let iters = block_loadable / 8;
     for _ in 0..iters {
         let mut key = 0u32;
         ptr::copy_nonoverlapping(keyptr, &mut key as *mut u32 as *mut u8, 3);
         keyptr = keyptr.offset(3);
 
-        let data = decode_block_avx(&mut dataptr, key & ((1 << 12) - 1));
-        _mm256_storeu_si256(outptr as *mut i64x4, data.into());
+        debug_assert!(dataptr.offset(32) <= data.as_ptr().offset(data.len() as isize));
+        let values = decode_block_avx(&mut dataptr, key & ((1 << 12) - 1));
+        _mm256_storeu_si256(outptr as *mut i64x4, values.into());
         outptr = outptr.offset(4);
 
-        let data = decode_block_avx(&mut dataptr, key >> 12);
-        _mm256_storeu_si256(outptr as *mut i64x4, data.into());
+        debug_assert!(dataptr.offset(32) <= data.as_ptr().offset(data.len() as isize));
+        let values = decode_block_avx(&mut dataptr, key >> 12);
+        _mm256_storeu_si256(outptr as *mut i64x4, values.into());
         outptr = outptr.offset(4);
     }
 
     let read = dataptr as usize - data.as_ptr() as usize;
     let output = slice::from_raw_parts_mut(outptr, output.len() - iters * 8);
-    let keys = slice::from_raw_parts(keyptr, keyptr as usize - keys.as_ptr() as usize);
-    let data = slice::from_raw_parts(dataptr, dataptr as usize - data.as_ptr() as usize);
+    let keys = slice::from_raw_parts(
+        keyptr,
+        keys.as_ptr().offset(keys.len() as isize) as usize - keyptr as usize,
+    );
+    let data = slice::from_raw_parts(
+        dataptr,
+        data.as_ptr().offset(data.len() as isize) as usize - dataptr as usize,
+    );
 
     decode_scalar(output, keys, data) + read
 }
@@ -226,23 +259,41 @@ pub unsafe fn encode(input: &[u64], buf: &mut [u8]) -> usize {
     let keys_len = keys_len(input.len());
     let (keys, data) = buf.split_at_mut(keys_len);
 
-    encode_scalar(input, keys, data)
+    keys_len + encode_scalar(input, keys, data)
 }
 
-pub unsafe fn decode(output: &mut [u64], buf: &[u8]) -> usize {
-    let keys_len = keys_len(output.len());
-    let (keys, data) = buf.split_at(keys_len);
+pub fn decode(output: &mut [u64], buf: &[u8]) -> usize {
+    unsafe {
+        let keys_len = keys_len(output.len());
+        let (keys, data) = buf.split_at(keys_len);
+        let data_len = compressed_len(output.len(), keys);
+        assert!(data.len() >= data_len, "{} < {}", data.len(), data_len);
 
-    if cfg_feature_enabled!("avx2") {
-        decode_avx(output, keys, data)
-    } else {
-        decode_scalar(output, keys, data)
+        if cfg_feature_enabled!("avx2") {
+            decode_avx(output, keys, data)
+        } else {
+            decode_scalar(output, keys, data)
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn check_compressed_len() {
+        unsafe {
+            let values = (0..4090)
+                .map(|v| v * (u64::max_value() / 4090))
+                .collect::<Vec<_>>();
+            let len = max_compressed_len(values.len());
+            let mut buf = vec![0; len];
+            let written = encode(&values, &mut buf);
+            let len = compressed_len(values.len(), &buf);
+            assert_eq!(written, keys_len(values.len()) + len);
+        }
+    }
 
     #[test]
     fn base_round_trip() {
@@ -254,8 +305,20 @@ mod test {
             let mut buf = vec![0; len];
             let written = encode(&values, &mut buf);
             let mut out = vec![0; values.len()];
-            let read = decode(&mut out, &buf[..written]);
-            assert_eq!(read, written);
+            decode(&mut out, &buf[..written]);
+            assert_eq!(values, out);
+        }
+    }
+
+    #[test]
+    fn short_round_trip() {
+        unsafe {
+            let values = [0, 1, 2, 3, 4, 5, 6, 7];
+            let len = max_compressed_len(values.len());
+            let mut buf = vec![0; len];
+            let written = encode(&values, &mut buf);
+            let mut out = [0; 8];
+            decode(&mut out, &buf[..written]);
             assert_eq!(values, out);
         }
     }
@@ -271,7 +334,7 @@ mod test {
 
             let written = encode_scalar(&values, &mut keys, &mut data);
             let mut out = vec![0; values.len()];
-            let read = decode_scalar(&mut out, &keys, &data[..written]);
+            let read = decode_scalar(&mut out, &keys, &data);
             assert_eq!(read, written);
             assert_eq!(values, out);
         }
