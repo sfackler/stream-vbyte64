@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["Steven Fackler <sfackler@palantir.com>"]
 
 [dependencies]
-stdsimd = { git = "https://github.com/rust-lang-nursery/stdsimd" }
+stdsimd = { git = "https://github.com/sfackler/stdsimd", branch = "const-constructor" }
 
 [dev-dependencies]
 rand = "0.3"

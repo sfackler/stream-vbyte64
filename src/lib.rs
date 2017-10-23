@@ -1,9 +1,22 @@
+#![feature(target_feature, cfg_target_feature)]
+
+#[macro_use]
 extern crate stdsimd;
 
 use std::ptr;
+use std::slice;
+use stdsimd::simd::{i64x4, u32x8, u64x4};
+use stdsimd::vendor::{_mm256_loadu_si256, _mm256_or_si256, _mm256_permutevar8x32_epi32,
+                      _mm256_shuffle_epi8, _mm256_storeu_si256};
+
+pub mod tables;
 
 pub fn keys_len(values: usize) -> usize {
     ((values + 7) / 8) * 3
+}
+
+pub fn max_compressed_len(values: usize) -> usize {
+    keys_len(values) + values * 8
 }
 
 unsafe fn encode_single(value: u64, out: &mut *mut u8) -> u8 {
@@ -156,9 +169,96 @@ pub unsafe fn decode_scalar(output: &mut [u64], keys: &[u8], data: &[u8]) -> usi
     read
 }
 
+#[target_feature = "+avx2"]
+unsafe fn decode_block_avx(ptr: &mut *const u8, code: u32) -> u64x4 {
+    let len = tables::LENGTH[code as usize];
+
+    let data = _mm256_loadu_si256(*ptr as *const i64x4);
+
+    let shuffle1 = tables::DECODE_SHUFFLE_1[code as usize];
+    let data1 = _mm256_shuffle_epi8(data.into(), shuffle1);
+
+    let shuffle2 = tables::DECODE_SHUFFLE_2[code as usize];
+    let shuffled2 = _mm256_shuffle_epi8(data.into(), shuffle2);
+    // FIXME use _mm256_permute6x64_epi64 instead
+    static PERMUTATION: u32x8 = u32x8::new(4, 4, 4, 4, 0, 1, 2, 3);
+    let data2 = _mm256_permutevar8x32_epi32(shuffled2.into(), PERMUTATION);
+
+    let data = _mm256_or_si256(data1.into(), data2.into());
+
+    *ptr = ptr.offset(len as isize);
+    data.into()
+}
+
+#[target_feature = "+avx2"]
+pub unsafe fn decode_avx(output: &mut [u64], keys: &[u8], data: &[u8]) -> usize {
+    let keys_len = keys_len(output.len());
+    debug_assert!(keys.len() >= keys_len);
+
+    let mut outptr = output.as_mut_ptr();
+    let mut keyptr = keys.as_ptr();
+    let mut dataptr = data.as_ptr();
+
+    let iters = output.len() / 8;
+    for _ in 0..iters {
+        let mut key = 0u32;
+        ptr::copy_nonoverlapping(keyptr, &mut key as *mut u32 as *mut u8, 3);
+        keyptr = keyptr.offset(3);
+
+        let data = decode_block_avx(&mut dataptr, key & ((1 << 12) - 1));
+        _mm256_storeu_si256(outptr as *mut i64x4, data.into());
+        outptr = outptr.offset(4);
+
+        let data = decode_block_avx(&mut dataptr, key >> 12);
+        _mm256_storeu_si256(outptr as *mut i64x4, data.into());
+        outptr = outptr.offset(4);
+    }
+
+    let read = dataptr as usize - data.as_ptr() as usize;
+    let output = slice::from_raw_parts_mut(outptr, output.len() - iters * 8);
+    let keys = slice::from_raw_parts(keyptr, keyptr as usize - keys.as_ptr() as usize);
+    let data = slice::from_raw_parts(dataptr, dataptr as usize - data.as_ptr() as usize);
+
+    decode_scalar(output, keys, data) + read
+}
+
+pub unsafe fn encode(input: &[u64], buf: &mut [u8]) -> usize {
+    let keys_len = keys_len(input.len());
+    let (keys, data) = buf.split_at_mut(keys_len);
+
+    encode_scalar(input, keys, data)
+}
+
+pub unsafe fn decode(output: &mut [u64], buf: &[u8]) -> usize {
+    let keys_len = keys_len(output.len());
+    let (keys, data) = buf.split_at(keys_len);
+
+    if cfg_feature_enabled!("avx2") {
+        decode_avx(output, keys, data)
+    } else {
+        decode_scalar(output, keys, data)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn base_round_trip() {
+        unsafe {
+            let values = (0..4090)
+                .map(|v| v * (u64::max_value() / 4090))
+                .collect::<Vec<_>>();
+            let len = max_compressed_len(values.len());
+            let mut buf = vec![0; len];
+            let written = encode(&values, &mut buf);
+            let mut out = vec![0; values.len()];
+            let read = decode(&mut out, &buf[..written]);
+            assert_eq!(read, written);
+            assert_eq!(values, out);
+        }
+    }
 
     #[test]
     fn scalar_round_trip() {
