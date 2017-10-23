@@ -5,8 +5,8 @@ extern crate stdsimd;
 
 use std::ptr;
 use std::slice;
-use stdsimd::simd::{i64x4, u32x8, u64x4};
-use stdsimd::vendor::{_mm256_loadu_si256, _mm256_or_si256, _mm256_permutevar8x32_epi32,
+use stdsimd::simd::{i64x4, u64x4};
+use stdsimd::vendor::{_mm256_loadu_si256, _mm256_or_si256, _mm256_permute4x64_epi64,
                       _mm256_shuffle_epi8, _mm256_storeu_si256};
 
 pub mod tables;
@@ -200,9 +200,7 @@ unsafe fn decode_block_avx(ptr: &mut *const u8, code: u32) -> u64x4 {
 
     let shuffle2 = tables::DECODE_SHUFFLE_2[code as usize];
     let shuffled2 = _mm256_shuffle_epi8(data.into(), shuffle2);
-    // FIXME use _mm256_permute6x64_epi64 instead
-    static PERMUTATION: u32x8 = u32x8::new(4, 4, 4, 4, 0, 1, 2, 3);
-    let data2 = _mm256_permutevar8x32_epi32(shuffled2.into(), PERMUTATION);
+    let data2 = _mm256_permute4x64_epi64(shuffled2.into(), 0b01001111);
 
     let data = _mm256_or_si256(data1.into(), data2.into());
 
