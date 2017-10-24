@@ -5,9 +5,10 @@ extern crate stdsimd;
 
 use std::ptr;
 use std::slice;
-use stdsimd::simd::{i64x4, u64x4};
-use stdsimd::vendor::{_mm256_loadu_si256, _mm256_or_si256, _mm256_permute4x64_epi64,
-                      _mm256_shuffle_epi8, _mm256_storeu_si256};
+use stdsimd::simd::{i32x8, i64x4, i8x32, u64x4, u8x32};
+use stdsimd::vendor::{_mm256_add_epi8, _mm256_loadu_si256, _mm256_min_epi8, _mm256_mullo_epi32,
+                      _mm256_or_si256, _mm256_permute4x64_epi64, _mm256_shuffle_epi8,
+                      _mm256_slli_epi64, _mm256_storeu_si256};
 
 pub mod tables;
 
@@ -108,6 +109,101 @@ pub unsafe fn encode_scalar(input: &[u64], keys: &mut [u8], data: &mut [u8]) -> 
     let written = dataptr as usize - data.as_mut_ptr() as usize;
     debug_assert!(written <= data.len());
     written
+}
+
+unsafe fn encode_block_avx(ptr: &mut *mut u8, value: u64x4) -> u32 {
+    let ones = i8x32::splat(1);
+    let low_shifter = 1 | 1 << 9 | 1 << 18;
+    let high_shifter = 1 | 1 << 9 | 1 << 18 | 1 << 27;
+    let shifts = i32x8::new(
+        low_shifter,
+        high_shifter,
+        low_shifter,
+        high_shifter,
+        low_shifter,
+        high_shifter,
+        low_shifter,
+        high_shifter,
+    );
+    let lane_codes = u8x32::new(
+        0,
+        3,
+        2,
+        3,
+        1,
+        3,
+        2,
+        3,
+        1,
+        4,
+        3,
+        4,
+        2,
+        4,
+        3,
+        4,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+    );
+    let gather_high = u8x32::new(
+        255,
+        255,
+        15,
+        7,
+        255,
+        255,
+        15,
+        7,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        15,
+        7,
+        255,
+        255,
+        15,
+        7,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+        255,
+    );
+
+    let mins = _mm256_min_epi8(value.into(), ones);
+    let bytemaps = _mm256_mullo_epi32(mins.into(), shifts);
+    let split_lane_codes = _mm256_shuffle_epi8(lane_codes, bytemaps.into());
+    let shifted_lane_codes = _mm256_slli_epi64(split_lane_codes.into(), 32);
+    let lane_codes = _mm256_add_epi8(split_lane_codes.into(), shifted_lane_codes.into());
+    let shuffled_codes = _mm256_shuffle_epi8(lane_codes.into(), gather_high);
+    let permuted = _mm256_permute4x64_epi64(shuffled_codes.into(), 0b00001110);
+    let high_bytes = _mm256_or_si256(shuffled_codes.into(), permuted.into());
+
+    panic!()
 }
 
 unsafe fn decode_single(ptr: &mut *const u8, code: u8) -> u64 {
