@@ -23,7 +23,7 @@ def print_lengths(lengths):
 
     for i, (a, b, c, d) in enumerate(lengths):
         if i % 32 == 0:
-            print("""\n    """, end="")
+            print("\n    ", end="")
         else:
             print(" ", end="")
         print("{},".format(a + b + c + d), end="")
