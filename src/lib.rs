@@ -1,14 +1,15 @@
-#![feature(target_feature, cfg_target_feature)]
-
-#[macro_use]
-extern crate stdsimd;
+#![feature(target_feature, cfg_target_feature, stdsimd)]
 
 use std::ptr;
 use std::slice;
-use stdsimd::simd::{i32x8, i64x4, u64x4, u8x32};
-use stdsimd::vendor::{_mm256_loadu_si256, _mm256_max_epu8, _mm256_min_epu8, _mm256_mullo_epi32,
-                      _mm256_or_si256, _mm256_permute4x64_epi64, _mm256_shuffle_epi8,
-                      _mm256_storeu_si256, _mm256_slli_epi64};
+
+#[cfg(target_arch = "x86")]
+use std::arch::x86::*;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+use std::mem::transmute;
+use std::simd::*;
 
 pub mod tables;
 
@@ -111,17 +112,19 @@ pub unsafe fn encode_scalar(input: &[u64], keys: &mut [u8], data: &mut [u8]) -> 
     written
 }
 
-#[target_feature = "+avx2"]
-unsafe fn encode_block_avx(ptr: &mut *mut u8, value: u64x4) -> u32 {
+#[target_feature(enable = "avx2")]
+unsafe fn encode_block_avx(ptr: &mut *mut u8, value: __m256i) -> u32 {
     // turn each byte into a 0 or 1 based on it being nonzero
-    let ones = u8x32::splat(1);
-    let mins = _mm256_min_epu8(value.into(), ones);
+    let ones = _mm256_set1_epi8(1);
+    let mins = _mm256_min_epu8(value, ones);
+    println!();
+    println!("{:?}", transmute::<_, u8x32>(value));
 
     // collect those bits into the high byte of each 32 bit part
     // the multiply acts like a multi-bit shift
     let low_shifter = 1 | 1 << 9 | 1 << 18;
     let high_shifter = 1 | 1 << 9 | 1 << 18 | 1 << 27;
-    let shifts = i32x8::new(
+    let shifts = _mm256_setr_epi32(
         low_shifter,
         high_shifter,
         low_shifter,
@@ -131,69 +134,69 @@ unsafe fn encode_block_avx(ptr: &mut *mut u8, value: u64x4) -> u32 {
         low_shifter,
         high_shifter,
     );
-    let bytemaps = _mm256_mullo_epi32(mins.into(), shifts);
+    let bytemaps = _mm256_mullo_epi32(mins, shifts);
 
     // use that as the mask vector to select the lane code
     // first the low half
     #[cfg_attr(rustfmt, rustfmt_skip)]
-    let low_lane_codes = u8x32::new(
-        0, 3, 2, 3, 1, 3, 2, 3, 255, 255, 255, 255, 255, 255, 255, 255,
-        0, 3, 2, 3, 1, 3, 2, 3, 255, 255, 255, 255, 255, 255, 255, 255,
+    let low_lane_codes = _mm256_setr_epi8(
+        0, 3, 2, 3, 1, 3, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1,
+        0, 3, 2, 3, 1, 3, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1,
     );
-    let low_shuffled_codes = _mm256_shuffle_epi8(low_lane_codes, bytemaps.into());
-    let low_shifted_codes = _mm256_slli_epi64(low_shuffled_codes.into(), 32);
+    let low_shuffled_codes = _mm256_shuffle_epi8(low_lane_codes, bytemaps);
+    let low_shifted_codes = _mm256_slli_epi64(low_shuffled_codes, 32);
 
     // now the high half
     #[cfg_attr(rustfmt, rustfmt_skip)]
-    let high_lane_codes = u8x32::new(
-        0, 7, 6, 7, 5, 7, 6, 7, 1, 7, 6, 7, 5, 7, 6, 7,
-        0, 7, 6, 7, 5, 7, 6, 7, 1, 7, 6, 7, 5, 7, 6, 7,
+    let high_lane_codes = _mm256_setr_epi8(
+        0, 7, 6, 7, 5, 7, 6, 7, 4, 7, 6, 7, 5, 7, 6, 7,
+        0, 7, 6, 7, 5, 7, 6, 7, 4, 7, 6, 7, 5, 7, 6, 7,
     );
-    let high_shuffled_codes = _mm256_shuffle_epi8(high_lane_codes, bytemaps.into());
+    let high_shuffled_codes = _mm256_shuffle_epi8(high_lane_codes, bytemaps);
 
     // overlay and take the max of the low and high codes
-    let lane_codes = _mm256_max_epu8(low_shifted_codes.into(), high_shuffled_codes.into());
+    let lane_codes = _mm256_max_epu8(low_shifted_codes, high_shuffled_codes);
+    println!("{:?}", transmute::<_, u8x32>(lane_codes));
 
     // now gather three copies of the lane codes from each lane
     #[cfg_attr(rustfmt, rustfmt_skip)]
-    let gather_high = u8x32::new(
-        255, 15, 7, 255, 255, 255, 255, 255, 255, 255, 15, 7, 255, 255, 255, 255,
-        7, 255, 255, 255, 255, 15, 7, 255, 15, 7, 255, 255, 255, 255, 255, 255,
+    let gather_high = _mm256_setr_epi8(
+        -1, 15, 7, -1, -1, -1, -1, -1, -1, -1, 15, 7, -1, -1, -1, -1,
+        7, -1, -1, -1, -1, 15, 7, -1, 15, 7, -1, -1, -1, -1, -1, -1,
     );
-    let shuffled_codes = _mm256_shuffle_epi8(lane_codes.into(), gather_high);
-    let permuted = _mm256_permute4x64_epi64(shuffled_codes.into(), 0b00001110);
-    let high_bytes = _mm256_or_si256(shuffled_codes.into(), permuted.into());
+    let shuffled_codes = _mm256_shuffle_epi8(lane_codes, gather_high);
+    let permuted = _mm256_permute4x64_epi64(shuffled_codes, 0b00001110);
+    let high_bytes = _mm256_or_si256(shuffled_codes, permuted);
+    println!("{:?}", transmute::<_, u8x32>(high_bytes));
 
     // we're going to concatenate and sum the lane codes at the same time
     let concat_low = 1 << 8 | 1 << 19 | 1 << 30;
     let concat_high = 1 << 6 | 1 << 17;
     let sum = 1 | 1 << 8 | 1 << 16 | 1 << 24;
-    let aggregators = i32x8::new(concat_low, concat_high, sum, 0, 0, 0, 0, 0);
+    let aggregators = _mm256_setr_epi32(concat_low, concat_high, sum, 0, 0, 0, 0, 0);
 
-    let code_and_length = _mm256_mullo_epi32(high_bytes.into(), aggregators);
-    let code_and_length = u8x32::from(code_and_length);
+    let code_and_length = _mm256_mullo_epi32(high_bytes, aggregators);
 
-    let code_low = code_and_length.extract(3);
-    let code_high = code_and_length.extract(7);
+    let code_low = _mm256_extract_epi8(code_and_length, 3) as u8;
+    let code_high = _mm256_extract_epi8(code_and_length, 7) as u8 & 0xf;
     let code = (code_low as u32) | ((code_high as u32) << 8);
-    let code = code & ((1 << 12) - 1);
-    let length = code_and_length.extract(11) + 4;
+    let length = _mm256_extract_epi8(code_and_length, 11) + 4;
 
-    let shuffle1 = tables::ENCODE_SHUFFLE_1[code as usize];
-    let data1 = _mm256_shuffle_epi8(value.into(), shuffle1);
+    let shuffle1 = tables::ENCODE_SHUFFLE_1[code as usize].v;
+    let data1 = _mm256_shuffle_epi8(value, shuffle1);
 
-    let shuffle2 = tables::ENCODE_SHUFFLE_2[code as usize];
-    let shuffled2 = _mm256_shuffle_epi8(value.into(), shuffle2);
-    let data2 = _mm256_permute4x64_epi64(shuffled2.into(), 0b00001110);
+    let shuffle2 = tables::ENCODE_SHUFFLE_2[code as usize].v;
+    let shuffled2 = _mm256_shuffle_epi8(value, shuffle2);
+    let data2 = _mm256_permute4x64_epi64(shuffled2, 0b00001110);
 
-    let data = _mm256_or_si256(data1.into(), data2.into());
-    _mm256_storeu_si256(*ptr as *mut i64x4, data.into());
+    let data = _mm256_or_si256(data1, data2);
+    _mm256_storeu_si256(*ptr as *mut __m256i, data);
     *ptr = ptr.offset(length as isize);
 
     code
 }
 
-#[target_feature = "+avx2"]
+#[target_feature(enable = "avx2")]
 pub unsafe fn encode_avx(input: &[u64], keys: &mut [u8], data: &mut [u8]) -> usize {
     debug_assert!(keys.len() >= keys_len(input.len()));
 
@@ -203,11 +206,11 @@ pub unsafe fn encode_avx(input: &[u64], keys: &mut [u8], data: &mut [u8]) -> usi
 
     let count = input.len() / 8;
     for _ in 0..count {
-        let data = _mm256_loadu_si256(inputptr as *mut i64x4);
+        let data = _mm256_loadu_si256(inputptr as *const __m256i);
         inputptr = inputptr.offset(4);
-        let code_low = encode_block_avx(&mut dataptr, data.into());
+        let code_low = encode_block_avx(&mut dataptr, data);
 
-        let data = _mm256_loadu_si256(inputptr as *mut i64x4);
+        let data = _mm256_loadu_si256(inputptr as *const __m256i);
         inputptr = inputptr.offset(4);
         let code_high = encode_block_avx(&mut dataptr, data.into());
 
@@ -309,26 +312,26 @@ pub unsafe fn decode_scalar(output: &mut [u64], keys: &[u8], data: &[u8]) -> usi
     read
 }
 
-#[target_feature = "+avx2"]
-unsafe fn decode_block_avx(ptr: &mut *const u8, code: u32) -> u64x4 {
+#[target_feature(enable = "avx2")]
+unsafe fn decode_block_avx(ptr: &mut *const u8, code: u32) -> __m256i {
     let len = tables::LENGTH[code as usize];
 
-    let data = _mm256_loadu_si256(*ptr as *const i64x4);
+    let data = _mm256_loadu_si256(*ptr as *const __m256i);
 
-    let shuffle1 = tables::DECODE_SHUFFLE_1[code as usize];
-    let data1 = _mm256_shuffle_epi8(data.into(), shuffle1);
+    let shuffle1 = tables::DECODE_SHUFFLE_1[code as usize].v;
+    let data1 = _mm256_shuffle_epi8(data, shuffle1);
 
-    let shuffle2 = tables::DECODE_SHUFFLE_2[code as usize];
-    let shuffled2 = _mm256_shuffle_epi8(data.into(), shuffle2);
-    let data2 = _mm256_permute4x64_epi64(shuffled2.into(), 0b01001111);
+    let shuffle2 = tables::DECODE_SHUFFLE_2[code as usize].v;
+    let shuffled2 = _mm256_shuffle_epi8(data, shuffle2);
+    let data2 = _mm256_permute4x64_epi64(shuffled2, 0b01001111);
 
-    let data = _mm256_or_si256(data1.into(), data2.into());
+    let data = _mm256_or_si256(data1, data2);
 
     *ptr = ptr.offset(len as isize);
     data.into()
 }
 
-#[target_feature = "+avx2"]
+#[target_feature(enable = "avx2")]
 pub unsafe fn decode_avx(output: &mut [u64], keys: &[u8], data: &[u8]) -> usize {
     let keys_len = keys_len(output.len());
     debug_assert!(keys.len() >= keys_len);
@@ -350,12 +353,12 @@ pub unsafe fn decode_avx(output: &mut [u64], keys: &[u8], data: &[u8]) -> usize 
 
         debug_assert!(dataptr.offset(32) <= data.as_ptr().offset(data.len() as isize));
         let values = decode_block_avx(&mut dataptr, key & ((1 << 12) - 1));
-        _mm256_storeu_si256(outptr as *mut i64x4, values.into());
+        _mm256_storeu_si256(outptr as *mut __m256i, values);
         outptr = outptr.offset(4);
 
         debug_assert!(dataptr.offset(32) <= data.as_ptr().offset(data.len() as isize));
         let values = decode_block_avx(&mut dataptr, key >> 12);
-        _mm256_storeu_si256(outptr as *mut i64x4, values.into());
+        _mm256_storeu_si256(outptr as *mut __m256i, values);
         outptr = outptr.offset(4);
     }
 
@@ -379,7 +382,7 @@ pub fn encode(input: &[u64], buf: &mut [u8]) -> usize {
         let keys_len = keys_len(input.len());
         let (keys, data) = buf.split_at_mut(keys_len);
 
-        let written = if cfg_feature_enabled!("avx2") {
+        let written = if is_target_feature_detected!("avx2") {
             encode_avx(input, keys, data)
         } else {
             encode_scalar(input, keys, data)
@@ -396,7 +399,7 @@ pub fn decode(output: &mut [u64], buf: &[u8]) -> usize {
         let data_len = compressed_data_len(output.len(), keys);
         assert!(data.len() >= data_len, "{} < {}", data.len(), data_len);
 
-        if cfg_feature_enabled!("avx2") {
+        if is_target_feature_detected!("avx2") {
             decode_avx(output, keys, data)
         } else {
             decode_scalar(output, keys, data)
@@ -458,6 +461,33 @@ mod test {
             let read = decode_scalar(&mut out, &keys, &data);
             assert_eq!(read, written);
             assert_eq!(values, out);
+        }
+    }
+
+    #[test]
+    fn match_encode() {
+        unsafe {
+            let values = [
+                5,
+                5 << 8 | 2,
+                5 << 16 | 2,
+                5 << 24 | 2,
+                5 << 32 | 2,
+                5 << 40 | 2,
+                5 << 48 | 2,
+                5 << 56 | 2,
+            ];
+            let mut keys1 = vec![0; keys_len(values.len())];
+            let mut data1 = vec![0; values.len() * 8];
+            let written1 = encode_scalar(&values, &mut keys1, &mut data1);
+
+            let mut keys2 = vec![0; keys_len(values.len())];
+            let mut data2 = vec![0; values.len() * 8];
+            let written2 = encode_avx(&values, &mut keys2, &mut data2);
+
+            assert_eq!(keys1, keys2);
+            assert_eq!(data1, data2);
+            assert_eq!(written1, written2);
         }
     }
 
