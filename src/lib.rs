@@ -117,8 +117,6 @@ unsafe fn encode_block_avx(ptr: &mut *mut u8, value: __m256i) -> u32 {
     // turn each byte into a 0 or 1 based on it being nonzero
     let ones = _mm256_set1_epi8(1);
     let mins = _mm256_min_epu8(value, ones);
-    println!();
-    println!("{:?}", transmute::<_, u8x32>(value));
 
     // collect those bits into the high byte of each 32 bit part
     // the multiply acts like a multi-bit shift
@@ -156,7 +154,6 @@ unsafe fn encode_block_avx(ptr: &mut *mut u8, value: __m256i) -> u32 {
 
     // overlay and take the max of the low and high codes
     let lane_codes = _mm256_max_epu8(low_shifted_codes, high_shuffled_codes);
-    println!("{:?}", transmute::<_, u8x32>(lane_codes));
 
     // now gather three copies of the lane codes from each lane
     #[cfg_attr(rustfmt, rustfmt_skip)]
@@ -167,7 +164,6 @@ unsafe fn encode_block_avx(ptr: &mut *mut u8, value: __m256i) -> u32 {
     let shuffled_codes = _mm256_shuffle_epi8(lane_codes, gather_high);
     let permuted = _mm256_permute4x64_epi64(shuffled_codes, 0b00001110);
     let high_bytes = _mm256_or_si256(shuffled_codes, permuted);
-    println!("{:?}", transmute::<_, u8x32>(high_bytes));
 
     // we're going to concatenate and sum the lane codes at the same time
     let concat_low = 1 << 8 | 1 << 19 | 1 << 30;
