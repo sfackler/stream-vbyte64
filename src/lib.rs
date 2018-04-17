@@ -8,9 +8,6 @@ use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-use std::mem::transmute;
-use std::simd::*;
-
 pub mod tables;
 
 pub fn keys_len(values: usize) -> usize {
@@ -378,7 +375,7 @@ pub fn encode(input: &[u64], buf: &mut [u8]) -> usize {
         let keys_len = keys_len(input.len());
         let (keys, data) = buf.split_at_mut(keys_len);
 
-        let written = if is_target_feature_detected!("avx2") {
+        let written = if is_x86_feature_detected!("avx2") {
             encode_avx(input, keys, data)
         } else {
             encode_scalar(input, keys, data)
@@ -395,7 +392,7 @@ pub fn decode(output: &mut [u64], buf: &[u8]) -> usize {
         let data_len = compressed_data_len(output.len(), keys);
         assert!(data.len() >= data_len, "{} < {}", data.len(), data_len);
 
-        if is_target_feature_detected!("avx2") {
+        if is_x86_feature_detected!("avx2") {
             decode_avx(output, keys, data)
         } else {
             decode_scalar(output, keys, data)
